@@ -21,16 +21,18 @@ import random
 import shutil
 from pathlib import Path
 
+import cv2
 import accelerate
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
+import torch.utils.data as data
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image
@@ -51,9 +53,16 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
+from metrics.edge_metrics import get_ods_ap
+from add_color_condition import add_3_channel_color_condition
+
+import warnings
+warnings.simplefilter(action='ignore')
+
 
 if is_wandb_available():
     import wandb
+    from wandb import AlertLevel
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.22.0.dev0")
@@ -70,6 +79,48 @@ def image_grid(imgs, rows, cols):
     for i, img in enumerate(imgs):
         grid.paste(img, box=(i % cols * w, i // cols * h))
     return grid
+
+def get_edge_metric(pred_images, condition_img):
+    t_lower = 100  # Lower Threshold 
+    t_upper = 200  # Upper threshold 
+
+    condition_img = np.array(condition_img.convert("L"))
+
+    avg_img_ap = 0
+    avg_img_ods = 0
+
+    avg_img_ap_blur = 0
+    avg_img_ods_blur = 0
+
+    condition_img_blur = cv2.blur(condition_img,(5,5))
+
+    for pred_image in pred_images:
+        pred_image = np.array(pred_image)
+        pred_image_edge = cv2.Canny(pred_image, t_lower, t_upper)
+        pred_image_edge_blur = cv2.blur(pred_image_edge,(5,5))
+
+        ods, ap = get_ods_ap(img_pred=pred_image_edge, img_true=condition_img)
+        ods_blur, ap_blur = get_ods_ap(img_pred=pred_image_edge_blur, img_true=condition_img_blur)
+
+        avg_img_ap += ap
+        avg_img_ods += ods
+
+        avg_img_ap_blur += ap_blur
+        avg_img_ods_blur += ods_blur
+
+    avg_img_ap = avg_img_ap / len(pred_images)
+    avg_img_ods = avg_img_ods / len(pred_images)
+
+    avg_img_ap_blur = avg_img_ap_blur / len(pred_images)
+    avg_img_ods_blur = avg_img_ods_blur / len(pred_images)
+
+    last_pred_image_edge = pred_image_edge
+    last_pred_image_edge_blur = pred_image_edge_blur
+
+    return  avg_img_ods, avg_img_ap, \
+            avg_img_ods_blur, avg_img_ap_blur, \
+            last_pred_image_edge, last_pred_image_edge_blur, condition_img_blur
+
 
 
 def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step):
@@ -115,22 +166,54 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
         )
 
     image_logs = []
+    val_avg_img_ods, val_avg_img_ap, val_avg_img_ods_blur, val_avg_img_ap_blur  = [], [], [], []
 
-    for validation_prompt, validation_image in zip(validation_prompts, validation_images):
-        validation_image = Image.open(validation_image).convert("RGB")
+    for validation_prompt, validation_image_init in zip(validation_prompts, validation_images):
+        if args.add_color_condition:
+            validation_color = validation_image_init.replace('image', 'color')
+            validation_color = Image.open(validation_color).convert("RGB")
+            
+        validation_image = Image.open(validation_image_init).convert("RGB")
+        
 
         images = []
+        ### add color condition
+        if args.add_color_condition:
+            validation_image_tensor = transforms.functional.pil_to_tensor(validation_image)
+            validation_color_tensor = transforms.functional.pil_to_tensor(validation_color)
+
+            # [6, 512, 512]
+            validation_image_color_tensor = torch.vstack((validation_image_tensor, validation_color_tensor))
+            # [1, 6, 512, 512]
+            validation_image_color_tensor = torch.unsqueeze(validation_image_color_tensor, 0)
+
+        if args.add_color_condition:
+            validation_image_for_pipeline = validation_image_color_tensor
+        else:
+            validation_image_for_pipeline = validation_image
 
         for _ in range(args.num_validation_images):
             with torch.autocast("cuda"):
                 image = pipeline(
-                    validation_prompt, validation_image, num_inference_steps=20, generator=generator
+                    validation_prompt, validation_image_for_pipeline, num_inference_steps=20, generator=generator
                 ).images[0]
 
             images.append(image)
 
+        avg_img_ods, avg_img_ap, \
+        avg_img_ods_blur, avg_img_ap_blur, \
+        last_image_edge, last_image_edge_blur, validation_image_blur = get_edge_metric(pred_images=images, 
+                                                                                       condition_img=validation_image)
+
+        val_avg_img_ods.append(avg_img_ods)
+        val_avg_img_ap.append(avg_img_ap)
+        val_avg_img_ods_blur.append(avg_img_ods_blur)
+        val_avg_img_ap_blur.append(avg_img_ap_blur)
+
         image_logs.append(
-            {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt}
+            {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt,
+            "last_image_edge": last_image_edge, "last_image_edge_blur": last_image_edge_blur,
+            "validation_image_blur": validation_image_blur}
         )
 
     for tracker in accelerator.trackers:
@@ -157,14 +240,24 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
                 images = log["images"]
                 validation_prompt = log["validation_prompt"]
                 validation_image = log["validation_image"]
+                validation_image_blur = log["validation_image_blur"]
+                last_image_edge = log["last_image_edge"]
+                last_image_edge_blur = log["last_image_edge_blur"]
 
                 formatted_images.append(wandb.Image(validation_image, caption="Controlnet conditioning"))
+                formatted_images.append(wandb.Image(validation_image_blur, caption="Controlnet conditioning BLUR"))
+                formatted_images.append(wandb.Image(last_image_edge, caption="Prediction image: Canny edge"))
+                formatted_images.append(wandb.Image(last_image_edge_blur, caption="Prediction image: Canny edge BLUR"))
 
                 for image in images:
                     image = wandb.Image(image, caption=validation_prompt)
                     formatted_images.append(image)
-
-            tracker.log({"validation": formatted_images})
+            
+            tracker.log({"validation": formatted_images,
+                         "edge_metric/ODS": np.mean(val_avg_img_ods),
+                         "edge_metric/AP": np.mean(val_avg_img_ap),
+                         "edge_metric_blur/ODS": np.mean(val_avg_img_ods_blur),
+                         "edge_metric_blur/AP": np.mean(val_avg_img_ap_blur)})
         else:
             logger.warn(f"image logging not implemented for {tracker.name}")
 
@@ -539,6 +632,21 @@ def parse_args(input_args=None):
         ),
     )
 
+    parser.add_argument(
+        "--add_color_condition",
+        action="store_true",
+        help="Adding color channels to the original conditioning image.",
+    )
+
+    parser.add_argument(
+        "--part_of_training_set",
+        type=float,
+        default=1.0,
+        help=(
+            "Size of training dataset as a part of full dataset."
+        ),
+    )
+
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
@@ -674,13 +782,34 @@ def make_train_dataset(args, tokenizer, accelerator):
 
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
-        images = [image_transforms(image) for image in images]
-
         conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
+
+        ### add color condition
+        if args.add_color_condition:
+            conditioning_colors = []
+
+            for i in range(len(conditioning_images)):
+                conditioning_color = add_3_channel_color_condition(cond_image=conditioning_images[i], 
+                                                                target_image=images[i])
+                conditioning_colors.append(conditioning_color)
+
+
+        images = [image_transforms(image) for image in images]
         conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
 
+        if args.add_color_condition:
+            conditioning_colors = [conditioning_image_transforms(conditioning_color) for conditioning_color in conditioning_colors]
+
+            conditioning_color_images = []
+            for i in range(len(conditioning_images)):
+                conditioning_color_image = torch.vstack((conditioning_images[i], conditioning_colors[i]))
+                conditioning_color_images.append(conditioning_color_image)
+
         examples["pixel_values"] = images
-        examples["conditioning_pixel_values"] = conditioning_images
+        if args.add_color_condition:
+            examples["conditioning_pixel_values"] = conditioning_color_images
+        else:
+            examples["conditioning_pixel_values"] = conditioning_images
         examples["input_ids"] = tokenize_captions(examples)
 
         return examples
@@ -880,6 +1009,13 @@ def main(args):
 
     train_dataset = make_train_dataset(args, tokenizer, accelerator)
 
+    if args.part_of_training_set < 1:
+        train_set_size = int(len(train_dataset) * args.part_of_training_set)
+        another_set_size = len(train_dataset) - train_set_size
+        seed = torch.Generator().manual_seed(42)
+
+        train_dataset, _ = data.random_split(train_dataset, [train_set_size, another_set_size], generator=seed)
+
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -1041,6 +1177,16 @@ def main(args):
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
+                if args.report_to == "wandb" and is_wandb_available():
+                    # threshold = 0.1
+                    detached_loss = loss.cpu().detach().numpy()
+                    if detached_loss == np.nan:
+                        wandb.alert(
+                                title="NaN loss",
+                                text=f"Loss {detached_loss} is NaN",
+                                level=AlertLevel.WARN,
+                            )
+
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     params_to_clip = controlnet.parameters()
@@ -1080,7 +1226,10 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-                    if args.validation_prompt is not None and global_step % args.validation_steps == 0:
+                    
+                    if args.validation_prompt is not None and (global_step % args.validation_steps == 0 \
+                                                            # add log_validation at first global step
+                                                                                    or global_step == 1):
                         image_logs = log_validation(
                             vae,
                             text_encoder,

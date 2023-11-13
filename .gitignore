@@ -1,5 +1,15 @@
 # Initially taken from Github's Python gitignore file
 
+# custom_folders (weights, datasets)
+checkpoints/
+fill50k/
+wandb/
+validation_set_inference/
+
+# run_scripts
+*.sh
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
