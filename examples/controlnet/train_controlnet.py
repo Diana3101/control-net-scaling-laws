@@ -169,11 +169,13 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     val_avg_img_ods, val_avg_img_ap, val_avg_img_ods_blur, val_avg_img_ap_blur  = [], [], [], []
 
     for validation_prompt, validation_image_init in zip(validation_prompts, validation_images):
-        if args.add_color_condition:
-            validation_color = validation_image_init.replace('image', 'color')
-            validation_color = Image.open(validation_color).convert("RGB")
-            
-        validation_image = Image.open(validation_image_init).convert("RGB")
+        validation_color = validation_image_init.replace('image', 'color')
+        validation_color = Image.open(validation_color).convert("RGB")
+        
+        if args.condition_image_channels == 1:
+            validation_image = Image.open(validation_image_init).convert("L")
+        elif args.condition_image_channels == 3:
+            validation_image = Image.open(validation_image_init).convert("RGB")
         
 
         images = []
@@ -181,9 +183,13 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
         if args.add_color_condition:
             validation_image_tensor = transforms.functional.pil_to_tensor(validation_image)
             validation_color_tensor = transforms.functional.pil_to_tensor(validation_color)
-
-            # [6, 512, 512]
-            validation_image_color_tensor = torch.vstack((validation_image_tensor, validation_color_tensor))
+            
+            if args.color_condition_stack_first:
+                validation_image_color_tensor = torch.vstack((validation_color_tensor, validation_image_tensor))
+            else:
+                # [6, 512, 512]
+                validation_image_color_tensor = torch.vstack((validation_image_tensor, validation_color_tensor))
+            
             # [1, 6, 512, 512]
             validation_image_color_tensor = torch.unsqueeze(validation_image_color_tensor, 0)
 
@@ -213,7 +219,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
         image_logs.append(
             {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt,
             "last_image_edge": last_image_edge, "last_image_edge_blur": last_image_edge_blur,
-            "validation_image_blur": validation_image_blur}
+            "validation_image_blur": validation_image_blur, "target_color": validation_color}
         )
 
     for tracker in accelerator.trackers:
@@ -240,6 +246,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
                 images = log["images"]
                 validation_prompt = log["validation_prompt"]
                 validation_image = log["validation_image"]
+                target_color = log["target_color"]
                 validation_image_blur = log["validation_image_blur"]
                 last_image_edge = log["last_image_edge"]
                 last_image_edge_blur = log["last_image_edge_blur"]
@@ -252,6 +259,8 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
                 for image in images:
                     image = wandb.Image(image, caption=validation_prompt)
                     formatted_images.append(image)
+                
+                formatted_images.append(wandb.Image(target_color, caption="Target colors"))
             
             tracker.log({"validation": formatted_images,
                          "edge_metric/ODS": np.mean(val_avg_img_ods),
@@ -639,6 +648,19 @@ def parse_args(input_args=None):
     )
 
     parser.add_argument(
+        "--condition_image_channels",
+        type=int,
+        default=3,
+        help="Channels of condition black&white image (can be 3 - RGB image or 1 - Grayscale image).",
+    )
+
+    parser.add_argument(
+        "--color_condition_stack_first",
+        action="store_true",
+        help="How to stack color condition to original condition: before or after original condition vector.",
+    )
+    
+    parser.add_argument(
         "--part_of_training_set",
         type=float,
         default=1.0,
@@ -782,7 +804,10 @@ def make_train_dataset(args, tokenizer, accelerator):
 
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
-        conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
+        if args.condition_image_channels == 1:
+            conditioning_images = [image.convert("L") for image in examples[conditioning_image_column]]
+        elif args.condition_image_channels == 3:
+            conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
 
         ### add color condition
         if args.add_color_condition:
@@ -802,7 +827,11 @@ def make_train_dataset(args, tokenizer, accelerator):
 
             conditioning_color_images = []
             for i in range(len(conditioning_images)):
-                conditioning_color_image = torch.vstack((conditioning_images[i], conditioning_colors[i]))
+                if args.color_condition_stack_first:
+                    conditioning_color_image = torch.vstack((conditioning_colors[i], conditioning_images[i]))
+                else:
+                    conditioning_color_image = torch.vstack((conditioning_images[i], conditioning_colors[i]))
+                
                 conditioning_color_images.append(conditioning_color_image)
 
         examples["pixel_values"] = images
@@ -903,12 +932,17 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
     )
 
+    if args.add_color_condition:
+        conditioning_channels = args.condition_image_channels + 3
+    else:
+        conditioning_channels = 3
+
     if args.controlnet_model_name_or_path:
         logger.info("Loading existing controlnet weights")
         controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path)
     else:
         logger.info("Initializing controlnet weights from unet")
-        controlnet = ControlNetModel.from_unet(unet)
+        controlnet = ControlNetModel.from_unet(unet, conditioning_channels=conditioning_channels)
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):

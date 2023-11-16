@@ -18,6 +18,8 @@ def add_3_channel_color_condition(cond_image, target_image):
     
     if len(cond_image_array.shape) == 3:
         cond_image_array_gs = np.array(cond_image.convert('L'))
+    elif len(cond_image_array.shape) == 2:
+        cond_image_array_gs = np.array(cond_image)
 
     edge_coordinates = np.argwhere(cond_image_array_gs == 255)
 
@@ -84,10 +86,13 @@ def get_validation_conditioning_colors(validation_set_len=5):
 
 # get_validation_conditioning_colors()
 
-# for idx in range(15):
-    # if idx == 14:
-    # cond_image = Image.open(cond_images_path + f'{idx}.png')
+# validation_relevant_colors_idxs = [19588, 43604, 24147, 16929, 22555]
+
+# i = 0
+# for idx in validation_relevant_colors_idxs:
+#     i += 1
+#     cond_image = Image.open(cond_images_path + f'{idx}.png')
     # target_image = Image.open(target_images_path + f'{idx}.png')
-    # im = add_3_channel_color_condition(cond_image=cond_image, 
-    #                                 target_image=target_image)
-    # im.save(f"color_cond_{idx}.png")
+#     im = add_3_channel_color_condition(cond_image=cond_image, 
+#                                     target_image=target_image)
+#     im.save(f"conditioning_color_{i}.png")
