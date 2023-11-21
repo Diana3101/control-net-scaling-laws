@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import torch.utils.data as data
+import torchvision.transforms.functional as tvf
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -55,6 +56,7 @@ from diffusers.utils.import_utils import is_xformers_available
 
 from metrics.edge_metrics import get_ods_ap
 from add_color_condition import add_3_channel_color_condition
+from augmentation import get_erased_image, get_noisy_image
 
 import warnings
 warnings.simplefilter(action='ignore')
@@ -171,13 +173,33 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     for validation_prompt, validation_image_init in zip(validation_prompts, validation_images):
         validation_color = validation_image_init.replace('image', 'color')
         validation_color = Image.open(validation_color).convert("RGB")
+
+        validation_image_original = Image.open(validation_image_init).convert("RGB")
         
         if args.condition_image_channels == 1:
             validation_image = Image.open(validation_image_init).convert("L")
         elif args.condition_image_channels == 3:
             validation_image = Image.open(validation_image_init).convert("RGB")
-        
 
+        if args.corrupt_validation_condition_images:
+            conditioning_image_transforms = transforms.Compose(
+                [
+                    transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+                    transforms.CenterCrop(args.resolution),
+                    transforms.ToTensor(),
+                ]
+                        )
+
+            validation_image_tensor = conditioning_image_transforms(validation_image)
+            
+            validation_image_tensor = get_erased_image(validation_image_tensor, 
+                                                       mode=args.corrupt_validation_condition_images)
+
+            if args.corrupt_validation_condition_images == 'hard':
+                validation_image_tensor = get_noisy_image(validation_image_tensor)
+
+            validation_image = tvf.to_pil_image(validation_image_tensor)
+            
         images = []
         ### add color condition
         if args.add_color_condition:
@@ -209,7 +231,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
         avg_img_ods, avg_img_ap, \
         avg_img_ods_blur, avg_img_ap_blur, \
         last_image_edge, last_image_edge_blur, validation_image_blur = get_edge_metric(pred_images=images, 
-                                                                                       condition_img=validation_image)
+                                                                                       condition_img=validation_image_original)
 
         val_avg_img_ods.append(avg_img_ods)
         val_avg_img_ap.append(avg_img_ap)
@@ -661,6 +683,21 @@ def parse_args(input_args=None):
     )
     
     parser.add_argument(
+        "--corrupt_train_condition_images",
+        type=str,
+        default='',
+        help="How to corrupt training conditining images. 3 possible options: ['', 'slightly', 'hard'].",
+    )
+
+    parser.add_argument(
+        "--corrupt_validation_condition_images",
+        type=str,
+        default='',
+        help="How to corrupt validation conditining images. 3 possible options: ['', 'slightly', 'hard'].",
+    )
+
+    
+    parser.add_argument(
         "--part_of_training_set",
         type=float,
         default=1.0,
@@ -821,6 +858,12 @@ def make_train_dataset(args, tokenizer, accelerator):
 
         images = [image_transforms(image) for image in images]
         conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
+
+        if args.corrupt_train_condition_images:
+            conditioning_images = [get_erased_image(image, mode=args.corrupt_train_condition_images) for image in conditioning_images]
+            
+            if args.corrupt_train_condition_images == 'hard':
+                conditioning_images = [get_noisy_image(image) for image in conditioning_images]
 
         if args.add_color_condition:
             conditioning_colors = [conditioning_image_transforms(conditioning_color) for conditioning_color in conditioning_colors]
