@@ -24,6 +24,7 @@ from pathlib import Path
 import cv2
 import accelerate
 import numpy as np
+import re
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -171,34 +172,40 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     val_avg_img_ods, val_avg_img_ap, val_avg_img_ods_blur, val_avg_img_ap_blur  = [], [], [], []
 
     for validation_prompt, validation_image_init in zip(validation_prompts, validation_images):
-        validation_color = validation_image_init.replace('image', 'color')
-        validation_color = Image.open(validation_color).convert("RGB")
+        if args.add_color_condition:
+            validation_color = validation_image_init.replace('image', 'color')
+            validation_color = Image.open(validation_color).convert("RGB")
 
-        validation_image_original = Image.open(validation_image_init).convert("RGB")
+        if 'corrupted' in validation_image_init:
+            pattern = re.compile(r'-(.*?)_corrupted')
+            original_path = re.sub(pattern, '', validation_image_init)
+            validation_image_original = Image.open(original_path).convert("RGB")
+        else:
+            validation_image_original = Image.open(validation_image_init).convert("RGB")
         
         if args.condition_image_channels == 1:
             validation_image = Image.open(validation_image_init).convert("L")
         elif args.condition_image_channels == 3:
             validation_image = Image.open(validation_image_init).convert("RGB")
 
-        if args.corrupt_validation_condition_images:
-            conditioning_image_transforms = transforms.Compose(
-                [
-                    transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-                    transforms.CenterCrop(args.resolution),
-                    transforms.ToTensor(),
-                ]
-                        )
+        # if args.corrupt_validation_condition_images:
+        #     conditioning_image_transforms = transforms.Compose(
+        #         [
+        #             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+        #             transforms.CenterCrop(args.resolution),
+        #             transforms.ToTensor(),
+        #         ]
+        #                 )
 
-            validation_image_tensor = conditioning_image_transforms(validation_image)
+        #     validation_image_tensor = conditioning_image_transforms(validation_image)
             
-            validation_image_tensor = get_erased_image(validation_image_tensor, 
-                                                       mode=args.corrupt_validation_condition_images)
+        #     validation_image_tensor = get_erased_image(validation_image_tensor, 
+        #                                                mode=args.corrupt_validation_condition_images)
 
-            if args.corrupt_validation_condition_images == 'hard':
-                validation_image_tensor = get_noisy_image(validation_image_tensor)
+        #     if args.corrupt_validation_condition_images == 'hard':
+        #         validation_image_tensor = get_noisy_image(validation_image_tensor)
 
-            validation_image = tvf.to_pil_image(validation_image_tensor)
+        #     validation_image = tvf.to_pil_image(validation_image_tensor)
             
         images = []
         ### add color condition
@@ -289,6 +296,15 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
                          "edge_metric/AP": np.mean(val_avg_img_ap),
                          "edge_metric_blur/ODS": np.mean(val_avg_img_ods_blur),
                          "edge_metric_blur/AP": np.mean(val_avg_img_ap_blur)})
+
+            if np.mean(val_avg_img_ods_blur) > 0.8 and args.wandb_alerts_counter == 0:
+                wandb.alert(
+                                title="Sudden converge!",
+                                text=f"edge_metric_blur/ODS: {np.mean(val_avg_img_ods_blur)}",
+                                level=AlertLevel.WARN,
+                            )
+                args.wandb_alerts_counter += 1
+
         else:
             logger.warn(f"image logging not implemented for {tracker.name}")
 
@@ -465,6 +481,13 @@ def parse_args(input_args=None):
         action="store_true",
         default=False,
         help="Scale the learning rate by the number of GPUs, gradient accumulation steps, and batch size.",
+    )
+    parser.add_argument(
+        "--scale_lr_div_4",
+        action="store_true",
+        default=False,
+        help="""Scale the learning rate by the number of GPUs, gradient accumulation steps, and batch size.
+                And divide by 4 (because 1e-5 works good for batch_size=1 and grad_accum=4)""",
     )
     parser.add_argument(
         "--lr_scheduler",
@@ -689,12 +712,11 @@ def parse_args(input_args=None):
         help="How to corrupt training conditining images. 3 possible options: ['', 'slightly', 'hard'].",
     )
 
-    parser.add_argument(
-        "--corrupt_validation_condition_images",
-        type=str,
-        default='',
-        help="How to corrupt validation conditining images. 3 possible options: ['', 'slightly', 'hard'].",
-    )
+    # parser.add_argument(
+    #     "--corrupted_validation_condition_images",
+    #     action="store_true",
+    #     help="Use corrupted validation conditining images or not.",
+    # )
 
     
     parser.add_argument(
@@ -703,6 +725,14 @@ def parse_args(input_args=None):
         default=1.0,
         help=(
             "Size of training dataset as a part of full dataset."
+        ),
+    )
+    parser.add_argument(
+        "--wandb_alerts_counter",
+        type=int,
+        default=0,
+        help=(
+            "To send alerts of sudden converge/high loss only one time. "
         ),
     )
 
@@ -1061,6 +1091,11 @@ def main(args):
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
+    if args.scale_lr_div_4:
+        args.learning_rate = (
+            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes / 4
+        )
+
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
     if args.use_8bit_adam:
         try:
@@ -1089,9 +1124,13 @@ def main(args):
     if args.part_of_training_set < 1:
         train_set_size = int(len(train_dataset) * args.part_of_training_set)
         another_set_size = len(train_dataset) - train_set_size
-        seed = torch.Generator().manual_seed(42)
 
-        train_dataset, _ = data.random_split(train_dataset, [train_set_size, another_set_size], generator=seed)
+        if args.seed is None:
+            generator = None
+        else:
+            generator = torch.Generator().manual_seed(args.seed)
+
+        train_dataset, _ = data.random_split(train_dataset, [train_set_size, another_set_size], generator=generator)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -1257,12 +1296,13 @@ def main(args):
                 if args.report_to == "wandb" and is_wandb_available():
                     # threshold = 0.1
                     detached_loss = loss.cpu().detach().numpy()
-                    if detached_loss == np.nan:
+                    if detached_loss > 0.5 and args.wandb_alerts_counter == 0:
                         wandb.alert(
-                                title="NaN loss",
-                                text=f"Loss {detached_loss} is NaN",
+                                title="High loss (> 0.5)",
+                                text=f"Loss: {detached_loss}",
                                 level=AlertLevel.WARN,
                             )
+                        args.wandb_alerts_counter += 1
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:

@@ -3,6 +3,7 @@ import torch
 from kornia.augmentation import RandomErasing, RandomThinPlateSpline
 from PIL import Image
 import torchvision.transforms.functional as tvf
+from torchvision import transforms
 
 # cut the part of the circle (RandomErasing)
 # def get_erased_image(image: torch.Tensor):
@@ -71,3 +72,27 @@ def get_noisy_image(image: torch.Tensor):
     # aug_image_pil.save(f'corrupted_images_hard/img_noisy_{idx}.png')
         
     return aug_image
+
+if __name__ == "__main__":
+    # save slightly corrupted validation images
+    for i in range(1, 6):
+        validation_image_path = f"validation_set/conditioning_image_{i}.png"
+        validation_image = Image.open(validation_image_path).convert("RGB")
+        conditioning_image_transforms = transforms.Compose([transforms.ToTensor()])
+        validation_image_tensor = conditioning_image_transforms(validation_image)
+        validation_image_tensor = get_erased_image(validation_image_tensor, 
+                                                    mode='slightly')
+        validation_image = tvf.to_pil_image(validation_image_tensor)
+        validation_image.save(f'validation_set-slightly_corrupted/conditioning_image_{i}.png')
+
+    # save hard corrupted validation images
+    for i in range(1, 6):
+        validation_image_path = f"validation_set/conditioning_image_{i}.png"
+        validation_image = Image.open(validation_image_path).convert("RGB")
+        conditioning_image_transforms = transforms.Compose([transforms.ToTensor()])
+        validation_image_tensor = conditioning_image_transforms(validation_image)
+        validation_image_tensor = get_erased_image(validation_image_tensor, 
+                                                    mode='hard')
+        validation_image_tensor = get_noisy_image(validation_image_tensor)
+        validation_image = tvf.to_pil_image(validation_image_tensor)
+        validation_image.save(f'validation_set-hard_corrupted/conditioning_image_{i}.png')
