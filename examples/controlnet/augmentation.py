@@ -73,6 +73,15 @@ def get_noisy_image(image: torch.Tensor):
         
     return aug_image
 
+
+def get_corrupted_image(image: torch.Tensor, mode: str):
+    image = get_erased_image(image=image, mode=mode)
+    if mode == 'slightly':
+        return image
+    elif mode == 'hard':
+        return get_noisy_image(image)
+
+
 if __name__ == "__main__":
     # save slightly corrupted validation images
     for i in range(1, 6):
@@ -80,8 +89,7 @@ if __name__ == "__main__":
         validation_image = Image.open(validation_image_path).convert("RGB")
         conditioning_image_transforms = transforms.Compose([transforms.ToTensor()])
         validation_image_tensor = conditioning_image_transforms(validation_image)
-        validation_image_tensor = get_erased_image(validation_image_tensor, 
-                                                    mode='slightly')
+        validation_image_tensor = get_corrupted_image(validation_image_tensor, mode='slightly')
         validation_image = tvf.to_pil_image(validation_image_tensor)
         validation_image.save(f'validation_set-slightly_corrupted/conditioning_image_{i}.png')
 
@@ -91,8 +99,6 @@ if __name__ == "__main__":
         validation_image = Image.open(validation_image_path).convert("RGB")
         conditioning_image_transforms = transforms.Compose([transforms.ToTensor()])
         validation_image_tensor = conditioning_image_transforms(validation_image)
-        validation_image_tensor = get_erased_image(validation_image_tensor, 
-                                                    mode='hard')
-        validation_image_tensor = get_noisy_image(validation_image_tensor)
+        validation_image_tensor = get_corrupted_image(validation_image_tensor, mode='hard')
         validation_image = tvf.to_pil_image(validation_image_tensor)
         validation_image.save(f'validation_set-hard_corrupted/conditioning_image_{i}.png')

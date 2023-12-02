@@ -57,7 +57,7 @@ from diffusers.utils.import_utils import is_xformers_available
 
 from metrics.edge_metrics import get_ods_ap
 from add_color_condition import add_3_channel_color_condition
-from augmentation import get_erased_image, get_noisy_image
+from augmentation import get_corrupted_image
 
 import warnings
 warnings.simplefilter(action='ignore')
@@ -168,147 +168,158 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
             "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
         )
 
-    image_logs = []
-    val_avg_img_ods, val_avg_img_ap, val_avg_img_ods_blur, val_avg_img_ap_blur  = [], [], [], []
+    val_types = args.type_corrupted_validation_images.split(',')
+    if '' not in val_types:
+        val_types = [''] + val_types
 
-    for validation_prompt, validation_image_init in zip(validation_prompts, validation_images):
-        if args.add_color_condition:
+    image_logs_all = []
+    wandb_logs = []
+    for val_type in val_types:
+        val_type = val_type.strip()
+        if val_type != '':
+            val_type += '_corrupted'
+
+        image_logs = []
+        val_avg_img_ods, val_avg_img_ap, val_avg_img_ods_blur, val_avg_img_ap_blur  = [], [], [], []
+
+        for validation_prompt, validation_image_init in zip(validation_prompts, validation_images):
+            validation_image_original = Image.open(validation_image_init).convert("RGB")
             validation_color = validation_image_init.replace('image', 'color')
             validation_color = Image.open(validation_color).convert("RGB")
 
-        if 'corrupted' in validation_image_init:
-            pattern = re.compile(r'-(.*?)_corrupted')
-            original_path = re.sub(pattern, '', validation_image_init)
-            validation_image_original = Image.open(original_path).convert("RGB")
-        else:
-            validation_image_original = Image.open(validation_image_init).convert("RGB")
-        
-        if args.condition_image_channels == 1:
-            validation_image = Image.open(validation_image_init).convert("L")
-        elif args.condition_image_channels == 3:
-            validation_image = Image.open(validation_image_init).convert("RGB")
-
-        # if args.corrupt_validation_condition_images:
-        #     conditioning_image_transforms = transforms.Compose(
-        #         [
-        #             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-        #             transforms.CenterCrop(args.resolution),
-        #             transforms.ToTensor(),
-        #         ]
-        #                 )
-
-        #     validation_image_tensor = conditioning_image_transforms(validation_image)
-            
-        #     validation_image_tensor = get_erased_image(validation_image_tensor, 
-        #                                                mode=args.corrupt_validation_condition_images)
-
-        #     if args.corrupt_validation_condition_images == 'hard':
-        #         validation_image_tensor = get_noisy_image(validation_image_tensor)
-
-        #     validation_image = tvf.to_pil_image(validation_image_tensor)
-            
-        images = []
-        ### add color condition
-        if args.add_color_condition:
-            validation_image_tensor = transforms.functional.pil_to_tensor(validation_image)
-            validation_color_tensor = transforms.functional.pil_to_tensor(validation_color)
-            
-            if args.color_condition_stack_first:
-                validation_image_color_tensor = torch.vstack((validation_color_tensor, validation_image_tensor))
-            else:
-                # [6, 512, 512]
-                validation_image_color_tensor = torch.vstack((validation_image_tensor, validation_color_tensor))
-            
-            # [1, 6, 512, 512]
-            validation_image_color_tensor = torch.unsqueeze(validation_image_color_tensor, 0)
-
-        if args.add_color_condition:
-            validation_image_for_pipeline = validation_image_color_tensor
-        else:
-            validation_image_for_pipeline = validation_image
-
-        for _ in range(args.num_validation_images):
-            with torch.autocast("cuda"):
-                image = pipeline(
-                    validation_prompt, validation_image_for_pipeline, num_inference_steps=20, generator=generator
-                ).images[0]
-
-            images.append(image)
-
-        avg_img_ods, avg_img_ap, \
-        avg_img_ods_blur, avg_img_ap_blur, \
-        last_image_edge, last_image_edge_blur, validation_image_blur = get_edge_metric(pred_images=images, 
-                                                                                       condition_img=validation_image_original)
-
-        val_avg_img_ods.append(avg_img_ods)
-        val_avg_img_ap.append(avg_img_ap)
-        val_avg_img_ods_blur.append(avg_img_ods_blur)
-        val_avg_img_ap_blur.append(avg_img_ap_blur)
-
-        image_logs.append(
-            {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt,
-            "last_image_edge": last_image_edge, "last_image_edge_blur": last_image_edge_blur,
-            "validation_image_blur": validation_image_blur, "target_color": validation_color}
+            if val_type != '':
+                folder, file = validation_image_init.split('/')[-2:]
+                validation_image_init = folder + f'-{val_type}/' + file
+                if not os.path.exists(validation_image_init):
+                    raise ValueError(
+                    f"{validation_image_init} path doesn't exist. Check `args.type_corrupted_validation_images` or path."
         )
 
-    for tracker in accelerator.trackers:
-        if tracker.name == "tensorboard":
-            for log in image_logs:
-                images = log["images"]
-                validation_prompt = log["validation_prompt"]
-                validation_image = log["validation_image"]
 
+            # if 'corrupted' in validation_image_init:
+            #     pattern = re.compile(r'-(.*?)_corrupted')
+            #     original_path = re.sub(pattern, '', validation_image_init)
+            #     validation_image_original = Image.open(original_path).convert("RGB")
+            #     validation_color = original_path.replace('image', 'color')
+            # else:
+            #     validation_image_original = Image.open(validation_image_init).convert("RGB")
+            #     validation_color = validation_image_init.replace('image', 'color')
+
+            if args.condition_image_channels == 1:
+                validation_image = Image.open(validation_image_init).convert("L")
+            elif args.condition_image_channels == 3:
+                validation_image = Image.open(validation_image_init).convert("RGB")
+                
+            images = []
+            ### add color condition
+            if args.add_color_condition:
+                validation_image_tensor = transforms.functional.pil_to_tensor(validation_image)
+                validation_color_tensor = transforms.functional.pil_to_tensor(validation_color)
+                
+                if args.color_condition_stack_first:
+                    validation_image_color_tensor = torch.vstack((validation_color_tensor, validation_image_tensor))
+                else:
+                    # [6, 512, 512]
+                    validation_image_color_tensor = torch.vstack((validation_image_tensor, validation_color_tensor))
+                
+                # [1, 6, 512, 512]
+                validation_image_color_tensor = torch.unsqueeze(validation_image_color_tensor, 0)
+
+            if args.add_color_condition:
+                validation_image_for_pipeline = validation_image_color_tensor
+            else:
+                validation_image_for_pipeline = validation_image
+
+            for _ in range(args.num_validation_images):
+                with torch.autocast("cuda"):
+                    image = pipeline(
+                        validation_prompt, validation_image_for_pipeline, num_inference_steps=20, generator=generator
+                    ).images[0]
+
+                images.append(image)
+
+            avg_img_ods, avg_img_ap, \
+            avg_img_ods_blur, avg_img_ap_blur, \
+            last_image_edge, last_image_edge_blur, validation_image_blur = get_edge_metric(pred_images=images, 
+                                                                                        condition_img=validation_image_original)
+
+            val_avg_img_ods.append(avg_img_ods)
+            val_avg_img_ap.append(avg_img_ap)
+            val_avg_img_ods_blur.append(avg_img_ods_blur)
+            val_avg_img_ap_blur.append(avg_img_ap_blur)
+
+            image_logs.append(
+                {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt,
+                "last_image_edge": last_image_edge, "last_image_edge_blur": last_image_edge_blur,
+                "validation_image_blur": validation_image_blur, "target_color": validation_color}
+            )
+            image_logs_all.extend(image_logs)
+
+        for tracker in accelerator.trackers:
+            if tracker.name == "tensorboard":
+                for log in image_logs:
+                    images = log["images"]
+                    validation_prompt = log["validation_prompt"]
+                    validation_image = log["validation_image"]
+
+                    formatted_images = []
+
+                    formatted_images.append(np.asarray(validation_image))
+
+                    for image in images:
+                        formatted_images.append(np.asarray(image))
+
+                    formatted_images = np.stack(formatted_images)
+
+                    tracker.writer.add_images(validation_prompt, formatted_images, step, dataformats="NHWC")
+            elif tracker.name == "wandb":
                 formatted_images = []
 
-                formatted_images.append(np.asarray(validation_image))
+                for log in image_logs:
+                    images = log["images"]
+                    validation_prompt = log["validation_prompt"]
+                    validation_image = log["validation_image"]
+                    target_color = log["target_color"]
+                    validation_image_blur = log["validation_image_blur"]
+                    last_image_edge = log["last_image_edge"]
+                    last_image_edge_blur = log["last_image_edge_blur"]
 
-                for image in images:
-                    formatted_images.append(np.asarray(image))
+                    formatted_images.append(wandb.Image(validation_image, caption="Controlnet conditioning"))
+                    formatted_images.append(wandb.Image(last_image_edge, caption="Prediction image: Canny edge"))
 
-                formatted_images = np.stack(formatted_images)
+                    if val_type == '':
+                        formatted_images.append(wandb.Image(validation_image_blur, caption="Controlnet conditioning BLUR"))
+                        formatted_images.append(wandb.Image(last_image_edge_blur, caption="Prediction image: Canny edge BLUR"))
+                        formatted_images.append(wandb.Image(target_color, caption="Target colors"))
 
-                tracker.writer.add_images(validation_prompt, formatted_images, step, dataformats="NHWC")
-        elif tracker.name == "wandb":
-            formatted_images = []
-
-            for log in image_logs:
-                images = log["images"]
-                validation_prompt = log["validation_prompt"]
-                validation_image = log["validation_image"]
-                target_color = log["target_color"]
-                validation_image_blur = log["validation_image_blur"]
-                last_image_edge = log["last_image_edge"]
-                last_image_edge_blur = log["last_image_edge_blur"]
-
-                formatted_images.append(wandb.Image(validation_image, caption="Controlnet conditioning"))
-                formatted_images.append(wandb.Image(validation_image_blur, caption="Controlnet conditioning BLUR"))
-                formatted_images.append(wandb.Image(last_image_edge, caption="Prediction image: Canny edge"))
-                formatted_images.append(wandb.Image(last_image_edge_blur, caption="Prediction image: Canny edge BLUR"))
-
-                for image in images:
-                    image = wandb.Image(image, caption=validation_prompt)
-                    formatted_images.append(image)
+                    for image in images:
+                        image = wandb.Image(image, caption=validation_prompt)
+                        formatted_images.append(image)
                 
-                formatted_images.append(wandb.Image(target_color, caption="Target colors"))
-            
-            tracker.log({"validation": formatted_images,
-                         "edge_metric/ODS": np.mean(val_avg_img_ods),
-                         "edge_metric/AP": np.mean(val_avg_img_ap),
-                         "edge_metric_blur/ODS": np.mean(val_avg_img_ods_blur),
-                         "edge_metric_blur/AP": np.mean(val_avg_img_ap_blur)})
+                wandb_logs.append({f"validation_{val_type}": formatted_images,
+                            f"edge_metric_{val_type}/ODS": np.mean(val_avg_img_ods),
+                            f"edge_metric_{val_type}/AP": np.mean(val_avg_img_ap),
+                            f"edge_metric_blur_{val_type}/ODS": np.mean(val_avg_img_ods_blur),
+                            f"edge_metric_blur_{val_type}/AP": np.mean(val_avg_img_ap_blur)})
 
-            if np.mean(val_avg_img_ods_blur) > 0.8 and args.wandb_alerts_counter == 0:
-                wandb.alert(
-                                title="Sudden converge!",
-                                text=f"edge_metric_blur/ODS: {np.mean(val_avg_img_ods_blur)}",
-                                level=AlertLevel.WARN,
-                            )
-                args.wandb_alerts_counter += 1
+                if np.mean(val_avg_img_ods_blur) > 0.8 and args.wandb_alerts_counter == 0:
+                    wandb.alert(
+                                    title="Sudden converge!",
+                                    text=f"edge_metric_blur_{val_type}/ODS: {np.mean(val_avg_img_ods_blur)}",
+                                    level=AlertLevel.WARN,
+                                )
+                    args.wandb_alerts_counter += 1
 
-        else:
-            logger.warn(f"image logging not implemented for {tracker.name}")
+            else:
+                logger.warn(f"image logging not implemented for {tracker.name}")
 
-        return image_logs
+    if tracker.name == "wandb":
+        wandb_logs = {key: value for d in wandb_logs for key, value in d.items()}
+        tracker.log(wandb_logs)
+    else:
+        print('Saving of several types of validation images (corruptions) implemented only for wandb tracker!')
+   
+    return image_logs_all
 
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
@@ -712,12 +723,17 @@ def parse_args(input_args=None):
         help="How to corrupt training conditining images. 3 possible options: ['', 'slightly', 'hard'].",
     )
 
-    # parser.add_argument(
-    #     "--corrupted_validation_condition_images",
-    #     action="store_true",
-    #     help="Use corrupted validation conditining images or not.",
-    # )
-
+    parser.add_argument(
+        "--type_corrupted_validation_images",
+        type=str,
+        default='',
+        help="""Which type of corrupted conditining images to validate. 
+                Use a list with 3 possible options: '', 'slightly', 'hard', 'slightly, hard'.
+                For this should exist separate folders:
+                like: original validation - 'validation_set', 
+                slightly corrupted validation - 'validation_set-slightly_corrupted',
+                where names of the files with condition images are the same in both folders.""",
+    )
     
     parser.add_argument(
         "--part_of_training_set",
@@ -727,6 +743,16 @@ def parse_args(input_args=None):
             "Size of training dataset as a part of full dataset."
         ),
     )
+
+    parser.add_argument(
+        "--prob_corruption",
+        type=float,
+        default=1.0,
+        help=(
+            "Probability of applying corruption to the train dataset."
+        ),
+    )
+
     parser.add_argument(
         "--wandb_alerts_counter",
         type=int,
@@ -890,10 +916,13 @@ def make_train_dataset(args, tokenizer, accelerator):
         conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
 
         if args.corrupt_train_condition_images:
-            conditioning_images = [get_erased_image(image, mode=args.corrupt_train_condition_images) for image in conditioning_images]
+            idxs_to_corrupt = random.sample(list(range(len(conditioning_images))), 
+                                                        int(len(conditioning_images)*args.prob_corruption))
             
-            if args.corrupt_train_condition_images == 'hard':
-                conditioning_images = [get_noisy_image(image) for image in conditioning_images]
+            conditioning_images = [get_corrupted_image(image, mode=args.corrupt_train_condition_images) \
+                                   if idx in idxs_to_corrupt \
+                                   else image \
+                                   for idx, image in enumerate(conditioning_images)]
 
         if args.add_color_condition:
             conditioning_colors = [conditioning_image_transforms(conditioning_color) for conditioning_color in conditioning_colors]
@@ -1343,10 +1372,11 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-                    
                     if args.validation_prompt is not None and (global_step % args.validation_steps == 0 \
                                                             # add log_validation at first global step
-                                                                                    or global_step == 1):
+                                                            or global_step == 1 \
+                                                            # add log_validation at last global step
+                                                            or global_step == args.max_train_steps):
                         image_logs = log_validation(
                             vae,
                             text_encoder,
