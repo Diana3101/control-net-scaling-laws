@@ -5,6 +5,10 @@ checkpoints/
 fill50k/
 wandb/
 validation_set_inference/
+corrupted_images_hard/
+corrupted_images_slightly/
+validation_set-slightly_corrupted/
+validation_set-hard_corrupted/
 
 # run_scripts
 *.sh
